@@ -33,6 +33,7 @@ import logging
 import asyncio
 from enum import IntEnum, unique
 import struct
+import zlib
 from collections import defaultdict
 import typing
 
@@ -45,6 +46,24 @@ logger = logging.getLogger(__name__)
 
 crc = syss_crc.CRC()
 crc.set_config_by_name("CRC-16/MODBUS")
+
+
+def write_png(buf, width, height):
+    assert len(buf) == width*height
+
+    def chunk(data):
+        return ((len(data) - 4).to_bytes(4, "big") +
+                data +
+                zlib.crc32(data).to_bytes(4, "big"))
+
+    data = b"".join(b"\x00" + buf[row*width:(row + 1)*width]
+                    for row in range(height))
+
+    return (
+        b"\x89PNG\r\n\x1a\n" +
+        chunk(b"IHDR" + struct.pack("!2I5B", width, height, 8, 0, 0, 0, 0)) +
+        chunk(b"IDAT" + zlib.compress(data, 9)) +
+        chunk(b"IEND"))
 
 
 class DateTime(typing.NamedTuple):
@@ -66,41 +85,74 @@ class DateTime(typing.NamedTuple):
 
 class FiberSettings(typing.NamedTuple):
     _fmt = struct.Struct(">16B")
-    # 0000641e01140c14281e0100288c8200
-    data: typing.List[int]
+    type: int  # SM,MM,DS,NZ,BIF,CZ1,CZ2,AUTO
+    z0: int
+    arc_current: int  # 10 mV (through a TIA?)
+    arc_time: int  # 100 ms
+    pre_current: int  # 10 mV
+    pre_time: int  # 100 ms
+    clean_current: int  # 10 mV
+    clean_time: int  # 100 ms
+    overlap: int  # 1 µm
+    angle_limit: int  # 0.1 deg
+    face_quality: int  # normal,standard,precise
+    align_mode: int
+    focus_target: int
+    arc_cal_target: int
+    arc_center: int  # ?
+    z1: int
 
     @classmethod
     def unpack(cls, buf):
-        return cls._make((cls._fmt.unpack(buf),))
+        return cls._make(cls._fmt.unpack(buf))
 
     def pack(self):
-        return self._fmt.pack(*self.data)
+        return self._fmt.pack(*self)
 
 
 class FiberFunc(typing.NamedTuple):
-    _fmt = struct.Struct(">12B")
-    # 02000001010001010a0109000000
-    data: typing.List[int]
+    _fmt = struct.Struct(">14B")
+    screen: int  # X,Y,XY,YX
+    angle_detection_dis: int
+    face_detection_dis: int
+    tensile_test_dis: int
+    arc_pause_dis: int
+    failure_image_dis: int
+    auto_focus_dis: int
+    auto_off_dis: int
+    brightness: int  # 10%
+    language: int  # CN,EN,PT,FR,RU,ES,PL,HI,AR,IT
+    beep_mode: int
+    z0: int
+    z1: int
+    z2: int
 
     @classmethod
     def unpack(cls, buf):
-        return cls._make((cls._fmt.unpack(buf),))
+        print(len(buf))
+        return cls._make(cls._fmt.unpack(buf))
 
     def pack(self):
-        return self._fmt.pack(*self.data)
+        return self._fmt.pack(*self)
 
 
 class HeatSettings(typing.NamedTuple):
     _fmt = struct.Struct(">8B")
-    # 04141211100f0000
-    data: typing.List[int]
+    config: int  # index
+    time0: int  # 60mm
+    time1: int  # 40mm
+    time2: int  # 34mm
+    time3: int  # 15mm
+    time4: int  # custom
+    preheat_dis: int
+    z0: int
 
     @classmethod
     def unpack(cls, buf):
-        return cls._make((cls._fmt.unpack(buf),))
+        return cls._make(cls._fmt.unpack(buf))
 
     def pack(self):
-        return self._fmt.pack(*self.data)
+        return self._fmt.pack(self)
 
 
 class AdminSettings(typing.NamedTuple):
@@ -167,10 +219,10 @@ class Op(IntEnum):
     GET_FIBER_SETTINGS = 0x11
     SET_FIBER_FUNC = 0x12
     GET_FIBER_FUNC = 0x13
-    SET_HEAT_TIME = 0x14
-    GET_HEAT_TIME = 0x15
-    SET_FIBER_ADMIN = 0x16
-    GET_FIBER_ADMIN = 0x17
+    SET_HEAT_SETTINGS = 0x14
+    GET_HEAT_SETTINGS = 0x15
+    SET_ADMIN_SETTINGS = 0x16
+    GET_ADMIN_SETTINGS = 0x17
     SET_AIO = 0x19  # ? Aio1-4
     GET_AIO = 0x20  # ? Aio1-4
     SET_RECORD_READ = 0x21  # mark read
@@ -234,7 +286,6 @@ class AI9:
 
     async def connect(self, dev):
         self.dev = dev
-        await self.dev.connect()
         await self.dev.start_notify(MESSAGE, self._handle_msg)
 
     def _handle_msg(self, _handle, msg):
@@ -421,54 +472,60 @@ def main():
                 lambda dev, addr:
                 dev.name and dev.name.startswith("AI-9:")
             )
-            await dev.connect(bleak.BleakClient(ble))
         elif args.address != "":
             ble = await bleak.BleakScanner.find_device_by_address(args.address)
-            await dev.connect(bleak.BleakClient(ble))
 
-        if True:
-            await dev.get(Op.GET_FIBER_SETTINGS, b"\x00")  # body=0x08?
-            await dev.get(Op.GET_FIBER_FUNC)  # body=0xff?
-            await dev.get(Op.GET_HEAT_TIME)
-            await dev.get(Op.GET_FIBER_ADMIN)
-            await dev.get(Op.GET_SERIAL)
-            await dev.get(Op.GET_DATETIME)
-            await dev.get(Op.GET_TOTAL_COUNT)
-            await dev.get(Op.GET_CURRENT_COUNT)
-            # await dev.set(Op.SET_CONNECTED)
+        async with bleak.BleakClient(ble) as ble:
+            await dev.connect(ble)
+            if True:
+                logger.info("%s", FiberSettings.unpack(
+                    await dev.get(Op.GET_FIBER_SETTINGS)))  # body=0x08 0x00?
+                logger.info("%s", FiberFunc.unpack(
+                    await dev.get(Op.GET_FIBER_FUNC)))  # body=0xff?
+                logger.info("%s", HeatSettings.unpack(
+                    await dev.get(Op.GET_HEAT_SETTINGS)))
+                logger.info("%s", AdminSettings.unpack(
+                    await dev.get(Op.GET_ADMIN_SETTINGS)))
+                logger.info("%s", DateTime.unpack(
+                    await dev.get(Op.GET_DATETIME)))
+                logger.info("%s", (await dev.get(Op.GET_SERIAL)).decode())
+                await dev.get(Op.GET_TOTAL_COUNT)
+                await dev.get(Op.GET_CURRENT_COUNT)
+                # await dev.set(Op.SET_CONNECTED)
 
-        if True:
-            await dev.set(Op.SET_MODE, b"\x01")  # factory mode, manual adjust
-            await dev.get(Op.GET_MODE)
-            for side in "left right".split():
-                for move in "down left right up".split():
-                    await dev.move(side, move, steps=100, speed=9)
-            # await dev.set(Op.SET_MOTOR_RESET, b"\x01")
-            # await dev.set(Op.SET_ARC, b"\x03")
-            # await dev.set(Op.SET_CLEAN)
-            # await dev.set(Op.SET_CONTINUE)
-            await dev.set(Op.SET_MODE, b"\x00")
-            await dev.get(Op.GET_MODE)
+            if True:
+                await dev.set(Op.SET_MODE, b"\x01")  # factory mode, manual adjust
+                await dev.get(Op.GET_MODE)
+                for side in "left right".split():
+                    for move in "down left right up".split():
+                        await dev.move(side, move, steps=100, speed=9)
+                # await dev.set(Op.SET_MOTOR_RESET, b"\x01")
+                # await dev.set(Op.SET_ARC, b"\x03")
+                # await dev.set(Op.SET_CLEAN)
+                # await dev.set(Op.SET_CONTINUE)
+                await dev.set(Op.SET_MODE, b"\x00")
+                await dev.get(Op.GET_MODE)
 
-        if True:
-            await dev.set(Op.SET_OPM_VFL_POWERDOWN, b"\xaa")  # enable
-            await dev.set(Op.SET_VFL_MODE, b"\x00")
-            await dev.set(Op.SET_OPM_UNITS, b"\x00")
-            await dev.set(Op.SET_OPM_WAVELENGTH, b"\x04")  # 4:1550
-            await dev.get(Op.GET_OPM)
-            await dev.set(Op.SET_OPM_VFL_POWERDOWN)  # disable
+            if True:
+                await dev.set(Op.SET_OPM_VFL_POWERDOWN, b"\xaa")  # enable
+                await dev.set(Op.SET_VFL_MODE, b"\x00")
+                await dev.set(Op.SET_OPM_UNITS, b"\x00")
+                await dev.set(Op.SET_OPM_WAVELENGTH, b"\x04")  # 4:1550
+                await dev.get(Op.GET_OPM)
+                await dev.set(Op.SET_OPM_VFL_POWERDOWN)  # disable
 
-        if True:
-            n = int.from_bytes(await dev.get(Op.GET_RECORD_LAST), "big")
-            for i in range(n + 1):
-                meta, img = await dev.read_record(i)
-                logger.info("image meta %s", meta)
-                open("img_{}_meta.bin".format(i), "wb").write(meta.pack())
-                if img is not None:
-                    open("img_{}.bin".format(i), "wb").write(img)
-            # await dev.set(Op.SET_RECORD_READ, (0).to_bytes("big"))
+            if True:
+                n = int.from_bytes(await dev.get(Op.GET_RECORD_LAST), "big")
+                for i in range(n + 1):
+                    meta, img = await dev.read_record(i)
+                    logger.info("image meta %s", meta)
+                    open("img_{}_meta.bin".format(i), "wb").write(meta.pack())
+                    if img is not None:
+                        open("img_{}.png".format(i), "wb").write(
+                            write_png(img, 640, 480))
+                # await dev.set(Op.SET_RECORD_READ, (0).to_bytes("big"))
 
-        await asyncio.sleep(1000)
+            await asyncio.sleep(1000)
 
     loop.run_until_complete(run())
 
