@@ -1,6 +1,6 @@
 # Signalfire AI-9
 
-Library to control the cheapo Signalfire AI-9 fusion splicer using bluetooth.
+Library to control the cheapo Signalfire AI-9 fusion splicer using bluetooth and python.
 Should run on Linux/Windows/OSX using the `bleak` bluetooth API.
 
 Setup:
